@@ -1,0 +1,70 @@
+name: Release
+
+# Pushing a tag like v0.8.9 builds the plugin, packages it as an .odPlugin and
+# publishes it (plus a SHA-256 checksum) as a GitHub Release.
+#
+#   1. bump VERSION, Cargo.toml and manifest.json to the same version, commit
+#   2. git tag v<version> && git push origin v<version>
+#
+# The tag must match VERSION exactly, otherwise the workflow stops.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Check tag matches VERSION
+        run: |
+          expected="v$(tr -d '[:space:]' < VERSION)"
+          if [[ "$GITHUB_REF_NAME" != "$expected" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match VERSION ($expected)"
+            exit 1
+          fi
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zip pkg-config libwayland-dev libxkbcommon-dev
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build and package
+        run: ./build-plugin.sh
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > release-notes.md <<'EOF'
+          ## Install
+
+          1. Download the `.odPlugin` file below.
+          2. In OpenDeck open **Plugins -> Install from file** and select it.
+          3. If the plugin does not start right away, restart OpenDeck.
+
+          Linux x86_64 only. Verify the download with the attached `.sha256` file.
+          EOF
+
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            # Re-run for an existing release: just refresh the assets.
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "Stream Deck Mobile for OpenDeck $GITHUB_REF_NAME" \
+              --notes-file release-notes.md \
+              --generate-notes
+          fi

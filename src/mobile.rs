@@ -1,0 +1,1929 @@
+use anyhow::Result;
+use base64::Engine as _;
+use blake2::{Blake2b, Blake2b512, Digest};
+use crypto_box::{
+    PublicKey, SalsaBox, SecretKey,
+    aead::{Aead, AeadCore, OsRng},
+};
+use futures::{SinkExt, StreamExt};
+use image::{GenericImageView, ImageEncoder};
+use prost::Message;
+use qrcodegen::{QrCode, QrCodeEcc};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::{
+    collections::{HashMap, HashSet},
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+    path::PathBuf,
+    sync::{OnceLock, LazyLock},
+    time::Duration,
+};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{Mutex, RwLock, mpsc},
+};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+use crate::openaction::{WsSink, send};
+use crate::ui;
+
+const PORT: u16 = 28198;
+const LEGACY_PORT: u16 = 28197;
+const SERVICE_TYPE: &str = "_elg._tcp.local.";
+const DEFAULT_ROWS: u8 = 3;
+const DEFAULT_COLS: u8 = 5;
+const MOBILE_NAME: &str = "Open Deck Mobile";
+const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
+// VSD2 HelloFromServer.version is the emulated Stream Deck Desktop/VSD2
+// server version, not this plugin's package version. Mobile uses this as
+// protocol/application capability metadata.
+const VSD2_SERVER_VERSION: &str = "2.14.0";
+const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+static CLIENTS: LazyLock<RwLock<HashMap<String, ClientHandle>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+// Discovery connections are intentionally separate from active virtual-device
+// sessions. Stream Deck Mobile may keep a discovery socket open before
+// OpenVirtualDevice, and it is also the channel on which we must invalidate a
+// removed virtual device immediately.
+static DISCOVERY_CLIENTS: LazyLock<RwLock<HashMap<String, HashMap<u64, mpsc::Sender<WsMessage>>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static SESSION_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+static CLIENT_KEYS: LazyLock<RwLock<HashMap<String, Vec<u8>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static CLIENT_NAMES: LazyLock<RwLock<HashMap<String, String>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static AUTHENTICATED: LazyLock<RwLock<HashSet<String>>> =
+    LazyLock::new(|| RwLock::new(HashSet::new()));
+static PENDING: LazyLock<RwLock<HashMap<String, PendingPairing>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+// Serialize the trust transition for one or more duplicate Authenticate
+// sockets from the same Mobile app. Mobile commonly opens parallel sockets;
+// without this guard they could all commit the same pairing independently.
+static TRUST_COMMIT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static IMAGE_CACHE: LazyLock<RwLock<HashMap<String, HashMap<u8, Option<String>>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static KEYPADS: LazyLock<RwLock<HashMap<String, KeypadConfig>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+// OpenDeck emits willAppear immediately after registerDevice. Cache the
+// resulting action metadata so the VSD2 Context contains the real OpenDeck
+// layout instead of synthetic empty actions.
+static APPEARANCES: LazyLock<RwLock<HashMap<String, HashMap<u8, AppearedAction>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+// What we last told OpenDeck a device's rows/columns are, so a genuine
+// resize can be told apart from a no-op re-registration (see
+// `update_device_registration` for why that distinction matters).
+static REGISTERED_DEVICE_SIZE: LazyLock<RwLock<HashMap<String, (u8, u8)>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static STATE: LazyLock<RwLock<PersistedState>> =
+    LazyLock::new(|| RwLock::new(PersistedState::load().unwrap_or_default()));
+
+#[derive(Clone)]
+struct ClientHandle {
+    tx: mpsc::Sender<WsMessage>,
+    session_id: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AppearedAction {
+    action: String,
+    title: String,
+    name: String,
+    category: String,
+    controller: String,
+    state: u16,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PendingPairing {
+    pub fingerprint: String,
+    pub name: String,
+    pub peer: String,
+    pub approved: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SavedDevice {
+    pub fingerprint: String,
+    pub public_key_b64: String,
+    pub name: String,
+    pub rows: u8,
+    pub columns: u8,
+    #[serde(default)]
+    pub vsd2_id: Option<String>,
+}
+
+
+async fn ensure_vsd2_id(fingerprint: &str) -> String {
+    // Never trust the persisted value as a wire-format authority. Older builds
+    // accidentally stored dm-* here; the VSD2 protocol is always sdm-*.
+    let expected = vsd2_device_id(fingerprint);
+    let existing = STATE.read().await.devices.iter()
+        .find(|d| d.fingerprint == fingerprint)
+        .and_then(|d| d.vsd2_id.clone());
+    if existing.as_deref() == Some(expected.as_str()) {
+        return expected;
+    }
+
+    // Migrate IDs generated by older plugin builds. Keeping one canonical
+    // VSD2 device ID is important because Mobile persists the ID in KnownHost.
+    let mut state = STATE.write().await;
+    if let Some(device) = state.devices.iter_mut().find(|d| d.fingerprint == fingerprint) {
+        device.vsd2_id = Some(expected.clone());
+        let _ = state.save();
+    }
+    expected
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct PersistedState {
+    devices: Vec<SavedDevice>,
+    // A trusted Mobile identity (its public key) and the virtual device it
+    // may currently have registered are two independent things — pairing a
+    // phone does both at once the *first* time, but deleting the virtual
+    // device afterward (from either the phone or the desktop) must not also
+    // revoke trust. The real Elgato app has no "unpair" concept at all on the
+    // desktop side; the only way a phone's trust ever changes is the phone
+    // itself getting a new identity (e.g. its app data is cleared). Keeping
+    // trust in its own map, separate from `devices`, is what makes that
+    // possible: removing a `SavedDevice` entry no longer removes the
+    // fingerprint from here, so the phone stays trusted and Mobile's "known
+    // device" reconnect (which expects to still be trusted) keeps working.
+    #[serde(default)]
+    trusted_keys: HashMap<String, String>,
+}
+
+impl PersistedState {
+    fn path() -> PathBuf {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+            return PathBuf::from(xdg).join("opendeck").join("streamdeck-mobile.json");
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".config/opendeck/streamdeck-mobile.json");
+        }
+        PathBuf::from("streamdeck-mobile.json")
+    }
+
+    fn load() -> Result<Self> {
+        let mut state: Self = match std::fs::read(Self::path()) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => return Err(e.into()),
+        };
+        // Migration for installs saved before trust was tracked separately:
+        // backfill trusted_keys from whatever devices are already on disk so
+        // existing pairings aren't silently dropped.
+        for device in &state.devices {
+            state.trusted_keys.entry(device.fingerprint.clone()).or_insert_with(|| device.public_key_b64.clone());
+        }
+        Ok(state)
+    }
+
+    fn save(&self) -> Result<()> {
+        let path = Self::path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        std::fs::rename(tmp, path)?;
+        Ok(())
+    }
+}
+
+pub fn opendeck_device_id(fingerprint: &str) -> String {
+    // OpenDeck routes device events by the first two characters of the device
+    // id and the manifest declares DeviceNamespace=dm. Keep this namespace
+    // strictly separate from the VSD2 virtual-device id.
+    format!("dm-{fingerprint}")
+}
+
+fn vsd2_device_id(fingerprint: &str) -> String {
+    // Stream Deck Mobile's VSD2 protocol uses the sdm- namespace.
+    format!("sdm-{fingerprint}")
+}
+
+fn raw_capture_enabled() -> bool {
+    std::env::var("OPENDECK_MOBILE_RAW").ok().as_deref() == Some("1")
+}
+
+fn raw_capture_path() -> PathBuf {
+    config_dir().join("streamdeck-mobile-wire.log")
+}
+
+fn raw_capture(direction: &str, peer: &str, label: &str, bytes: &[u8]) {
+    if !raw_capture_enabled() { return; }
+    let hex = bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| format!("{}.{}", d.as_secs(), d.subsec_millis()))
+        .unwrap_or_else(|_| "0.000".to_owned());
+    if let Some(parent) = raw_capture_path().parent() { let _ = std::fs::create_dir_all(parent); }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(raw_capture_path()) {
+        use std::io::Write as _;
+        let _ = writeln!(f, "{} {} peer={} label={} len={}\n{}", elapsed, direction, peer, label, bytes.len(), hex);
+    }
+}
+
+pub(crate) fn config_dir() -> PathBuf {
+    PersistedState::path().parent().unwrap().to_path_buf()
+}
+
+pub(crate) fn ui_ipc_socket_path() -> PathBuf {
+    config_dir().join("streamdeck-mobile-ui.sock")
+}
+
+/// Read the saved-device list directly from disk. The Management window now
+/// runs in its own short-lived process (see `ui::run_management_process`)
+/// that never touches the main plugin's in-memory `STATE`, so it polls the
+/// same JSON file the main process persists to instead.
+pub fn saved_devices_from_disk() -> Vec<SavedDevice> {
+    PersistedState::load().map(|s| s.devices).unwrap_or_default()
+}
+
+fn fingerprint(key: &[u8]) -> String {
+    let mut h = Blake2b::<blake2::digest::consts::U32>::new();
+    h.update(key);
+    h.finalize().iter().take(3).map(|b| format!("{b:02x}")).collect()
+}
+
+fn server_secret() -> SecretKey {
+    static SECRET: OnceLock<SecretKey> = OnceLock::new();
+    SECRET.get_or_init(|| {
+        let machine_id = std::fs::read_to_string("/etc/machine-id").unwrap_or_default();
+        let hostname = hostname();
+        let mut h = Blake2b512::new();
+        h.update(b"OpenDeck Stream Deck Mobile VSD2 server key v1");
+        h.update(hostname.as_bytes());
+        h.update(machine_id.trim().as_bytes());
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&h.finalize()[..32]);
+        SecretKey::from(bytes)
+    }).clone()
+}
+
+fn server_public_key() -> Vec<u8> {
+    server_secret().public_key().as_bytes().to_vec()
+}
+
+fn hostname() -> String {
+    if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
+        let s = s.trim();
+        if !s.is_empty() {
+            return s.to_owned();
+        }
+    }
+    std::env::var("HOSTNAME").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "OpenDeck".into())
+}
+
+fn workstation_id() -> String {
+    // Once a Mobile client discovers this host it caches this ID for that
+    // "known device" entry, and appears to keep using the cached value
+    // rather than re-reading it from mDNS on every connect. So whatever we
+    // persist here needs to stay stable forever, not just look plausible.
+    // Trust anything already on disk (any format) instead of requiring the
+    // "sr-<22 chars>" shape a previous version of this function enforced.
+    let path = config_dir().join("streamdeck-mobile-workstation-id");
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        let s = s.trim();
+        if !s.is_empty() {
+            return s.into();
+        }
+    }
+
+    let machine_id = std::fs::read_to_string("/etc/machine-id").unwrap_or_default();
+    let mut h = Blake2b512::new();
+    h.update(b"OpenDeck Stream Deck Mobile workstation ID v4");
+    h.update(hostname().as_bytes());
+    h.update(machine_id.trim().as_bytes());
+    let enc = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&h.finalize()[..14]);
+    let value = format!("sr-{enc}");
+    let _ = std::fs::create_dir_all(config_dir());
+    let _ = std::fs::write(&path, &value);
+    value
+}
+
+fn pairing_token() -> String {
+    let machine_id = std::fs::read_to_string("/etc/machine-id").unwrap_or_default();
+    let mut h = Blake2b512::new();
+    h.update(b"OpenDeck Stream Deck Mobile pairing token v1");
+    h.update(hostname().as_bytes());
+    h.update(machine_id.trim().as_bytes());
+    let digest = h.finalize();
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    digest.iter().cycle().take(27).map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char).collect()
+}
+
+/// The first non-loopback IPv4 address on a `wl*`-named interface (the
+/// standard Linux naming for WiFi: wlan0, wlp2s0, wlx...), if one is up.
+fn wifi_ipv4() -> Option<Ipv4Addr> {
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return None;
+        }
+        let mut found = None;
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            cur = ifa.ifa_next;
+            if ifa.ifa_addr.is_null() || ifa.ifa_name.is_null() {
+                continue;
+            }
+            if (*ifa.ifa_addr).sa_family as i32 != libc::AF_INET {
+                continue;
+            }
+            let Ok(name) = std::ffi::CStr::from_ptr(ifa.ifa_name).to_str() else { continue };
+            if !name.starts_with("wl") {
+                continue;
+            }
+            let addr_in = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+            let ip = Ipv4Addr::from(u32::from_be(addr_in.sin_addr.s_addr));
+            if !ip.is_loopback() && !ip.is_unspecified() {
+                found = Some(ip);
+                break;
+            }
+        }
+        libc::freeifaddrs(ifap);
+        found
+    }
+}
+
+fn local_ipv4() -> Option<Ipv4Addr> {
+    // Prefer an active WiFi interface's address over whatever the OS
+    // considers the default route. On a machine with both a wired Ethernet
+    // connection (to, say, the home router) and WiFi (e.g. joined to a
+    // phone's hotspot for testing), Ethernet almost always wins the routing
+    // metric — so "ask the OS which interface it would use to reach the
+    // internet" keeps returning the wired LAN address even while connected
+    // to a completely different WiFi network that Mobile is actually on.
+    // Phones connect over WiFi, so that interface's address is the one worth
+    // advertising whenever it exists; this only changes anything when WiFi
+    // is actually up; on a plain wired-only setup it falls through exactly
+    // as before.
+    if let Some(ip) = wifi_ipv4() {
+        return Some(ip);
+    }
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(8, 8, 8, 8), 53)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if !ip.is_loopback() => Some(ip),
+        _ => None,
+    }
+}
+
+fn qr_data_url(payload: &str) -> Result<String> {
+    let qr = QrCode::encode_text(payload, QrCodeEcc::Medium).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let size = qr.size();
+    let border = 4i32;
+    let mut path = String::new();
+    for y in 0..size {
+        for x in 0..size {
+            if qr.get_module(x, y) {
+                path.push_str(&format!("M{} {}h1v1h-1z", x + border, y + border));
+            }
+        }
+    }
+    let view = size + border * 2;
+    let svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {view} {view}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#fff"/><path d="{path}" fill="#000"/></svg>"##
+    );
+    Ok(format!("data:image/svg+xml;base64,{}", base64::engine::general_purpose::STANDARD.encode(svg)))
+}
+
+pub fn qr_color_image(payload: &str) -> Result<eframe::egui::ColorImage> {
+    let qr = QrCode::encode_text(payload, QrCodeEcc::Medium)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let border = 4usize;
+    let modules = qr.size() as usize;
+    let side = modules + border * 2;
+    let scale = 4usize;
+    let pixels_side = side * scale;
+
+    let mut pixels = Vec::with_capacity(pixels_side * pixels_side);
+    for py in 0..pixels_side {
+        let my = py / scale;
+        for px in 0..pixels_side {
+            let mx = px / scale;
+            let dark = mx >= border && my >= border
+                && mx < border + modules
+                && my < border + modules
+                && qr.get_module((mx - border) as i32, (my - border) as i32);
+            pixels.push(if dark { eframe::egui::Color32::BLACK } else { eframe::egui::Color32::WHITE });
+        }
+    }
+
+    Ok(eframe::egui::ColorImage {
+        size: [pixels_side, pixels_side],
+        pixels,
+        source_size: eframe::egui::vec2(pixels_side as f32, pixels_side as f32),
+    })
+}
+
+fn random_qr_token() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut x = nanos ^ ((std::process::id() as u128) << 64);
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut out = String::with_capacity(27);
+    for _ in 0..27 {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        out.push(ALPHABET[(x as usize) % ALPHABET.len()] as char);
+    }
+    out
+}
+
+pub fn pairing_info() -> Result<PairingInfo> {
+    let address = local_ipv4().unwrap_or(Ipv4Addr::LOCALHOST);
+    let workstation = workstation_id();
+    // QR pairing uses fresh one-time token. mDNS keeps stable discovery token.
+    let token = random_qr_token();
+    let qr_url = format!(
+        "https://streamdeck.elgato.com/connect/?t={}&w={}&a={}:{}&av2={}:{}",
+        urlencoding::encode(&token),
+        urlencoding::encode(&workstation),
+        address,
+        LEGACY_PORT,
+        address,
+        PORT
+    );
+    log::info!("[PAIRING_QR] generated workstation={} address={} legacy_port={} vsd2_port={} token_len={}", workstation, address, LEGACY_PORT, PORT, token.len());
+    Ok(PairingInfo {
+        qr_url: qr_url.clone(),
+        qr_data_url: qr_data_url(&qr_url)?,
+        address: address.to_string(),
+        workstation_id: workstation,
+        hostname: hostname(),
+        vsd2_port: PORT,
+        legacy_port: LEGACY_PORT,
+    })
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PairingInfo {
+    pub qr_url: String,
+    pub qr_data_url: String,
+    pub address: String,
+    pub workstation_id: String,
+    pub hostname: String,
+    pub vsd2_port: u16,
+    pub legacy_port: u16,
+}
+
+pub async fn pending_pairings() -> Vec<PendingPairing> {
+    PENDING.read().await.values().cloned().collect()
+}
+
+pub async fn saved_devices() -> Vec<SavedDevice> {
+    STATE.read().await.devices.clone()
+}
+
+pub async fn approve(fingerprint: &str, approve: bool) -> Result<()> {
+    log::info!("[PAIRING_APPROVE_CALL] fingerprint={} approve={}", fingerprint, approve);
+    let already_trusted = AUTHENTICATED.read().await.contains(fingerprint);
+    let mut pending = PENDING.write().await;
+    if let Some(item) = pending.get_mut(fingerprint) {
+        item.approved = approve;
+    } else if approve && already_trusted {
+        log::info!("[PAIRING_APPROVE_DONE] fingerprint={} approved=true already_trusted=true", fingerprint);
+        return Ok(());
+    } else {
+        anyhow::bail!("No pending pairing for {fingerprint}");
+    }
+    drop(pending);
+
+    if !approve {
+        PENDING.write().await.remove(fingerprint);
+        log::info!("[MOBILE] pairing rejected fingerprint={fingerprint}");
+        return Ok(());
+    }
+
+    // The Authenticate handler owns the trust commit and encrypted OK. The UI
+    // only releases the pending request; it does not persist trust itself.
+    log::info!("[PAIRING_APPROVE_DONE] fingerprint={} approved=true trust_persisted=false", fingerprint);
+    log::info!("[MOBILE] pairing approved fingerprint={fingerprint}; Authenticate handler may now commit");
+    Ok(())
+}
+
+pub async fn rename_device(fingerprint: &str, name: &str, oa: &WsSink) -> Result<()> {
+    let name = if name.trim().is_empty() { MOBILE_NAME } else { name.trim() };
+
+    let device_id = opendeck_device_id(fingerprint);
+    {
+        let mut state = STATE.write().await;
+        let Some(device) = state.devices.iter_mut().find(|d| d.fingerprint == fingerprint) else {
+            anyhow::bail!("No saved Mobile device {fingerprint}");
+        };
+        device.name = name.to_owned();
+        state.save()?;
+    }
+
+    let device = STATE.read().await.devices.iter().find(|d| d.fingerprint == fingerprint).cloned();
+    if let Some(device) = device {
+        register_openaction_device_retry(oa, &device).await?;
+        let vdl = vec![VirtualDevice { id: device_id.clone(), name: device.name.clone() }];
+        let _ = send_live_vdl(fingerprint, vdl).await;
+    }
+    Ok(())
+}
+
+/// Removes the *virtual device* for this Mobile identity — deregisters it
+/// from OpenDeck and forgets its layout/name. This intentionally does NOT
+/// touch the phone's trust (AUTHENTICATED/CLIENT_KEYS/trusted_keys): a
+/// virtual device and the pairing that lets a phone create one are
+/// independent (see PersistedState). This is the same action `Some(
+/// client_message::Payload::DeleteVirtualDevice)` performs when the phone
+/// asks for it — the desktop "Remove" button and Mobile's own delete now
+/// behave identically, and the phone stays a known, trusted workstation
+/// afterward so reconnecting to it doesn't require re-pairing.
+pub async fn remove_device(fingerprint: &str, oa: &WsSink) -> Result<()> {
+    let device_id = opendeck_device_id(fingerprint);
+
+    // Remove the device from OpenDeck's live registry first.
+    let _ = deregister_openaction_device(oa, &device_id).await;
+
+    // Tell every open discovery socket for this identity that it has no
+    // virtual device anymore, then close those sockets so Mobile reconnects
+    // promptly with a fresh Hello instead of possibly sitting on stale state.
+    send_empty_vdl_to_discovery(fingerprint).await?;
+    let _ = refresh_trusted_discovery(fingerprint).await;
+
+    if let Some(client) = CLIENTS.write().await.remove(&device_id) {
+        let _ = client.tx.send(WsMessage::Close(None)).await;
+    }
+
+    {
+        let mut state = STATE.write().await;
+        let before = state.devices.len();
+        state.devices.retain(|d| d.fingerprint != fingerprint);
+        if state.devices.len() == before {
+            anyhow::bail!("No saved Mobile device {fingerprint}");
+        }
+        state.save()?;
+    }
+
+    IMAGE_CACHE.write().await.remove(&device_id);
+    KEYPADS.write().await.remove(&device_id);
+    REGISTERED_DEVICE_SIZE.write().await.remove(&device_id);
+
+    // The Management window is a separate process that polls the saved-device
+    // file directly (see `saved_devices_from_disk`), so it picks up this
+    // removal on its own next tick without needing to be told to close.
+    log::info!("[MOBILE] removed virtual device fingerprint={fingerprint} device_id={device_id} (trust unaffected)");
+    Ok(())
+}
+
+pub async fn initialize_saved_devices(oa: &WsSink) -> Result<()> {
+    let state = STATE.read().await.clone();
+    // Trust is keyed off trusted_keys, independent of whether a virtual
+    // device currently exists for that fingerprint (see PersistedState).
+    for (fingerprint, public_key_b64) in &state.trusted_keys {
+        AUTHENTICATED.write().await.insert(fingerprint.clone());
+        let key = base64::engine::general_purpose::STANDARD.decode(public_key_b64.as_bytes())?;
+        CLIENT_KEYS.write().await.insert(fingerprint.clone(), key);
+    }
+    // OpenDeck only adds our DeviceNamespace after the plugin registration
+    // event has been processed. Retry registration for a short window so a
+    // cold start cannot lose persisted Mobile devices.
+    for device in state.devices {
+        register_openaction_device_retry(oa, &device).await?;
+    }
+    Ok(())
+}
+
+async fn register_openaction_device(oa: &WsSink, device: &SavedDevice) -> Result<()> {
+    let device_id = opendeck_device_id(&device.fingerprint);
+    log::info!("[OPENACTION] REGISTER_DEVICE_TX id={} name={:?} layout={}x{}", device_id, device.name, device.rows, device.columns);
+    let payload = json!({
+        "event": "registerDevice",
+        "payload": {
+            "id": device_id,
+            "name": device.name,
+            "rows": device.rows,
+            "columns": device.columns,
+            "encoders": 0,
+            "touchpoints": 0,
+            "infobars": 0,
+            "type": 3
+        }
+    });
+    send(oa, payload).await?;
+    REGISTERED_DEVICE_SIZE.write().await.insert(device_id, (device.rows, device.columns));
+    Ok(())
+}
+
+async fn register_openaction_device_retry(oa: &WsSink, device: &SavedDevice) -> Result<()> {
+    // OpenDeck adds the plugin's DeviceNamespace when registerPlugin is
+    // processed. A persisted device can race that registration on startup, so
+    // retry the upsert for a short period. There is no destructive deregister
+    // here; registerDevice is treated as an idempotent OpenDeck upsert.
+    let mut last_error = None;
+    for attempt in 0..5 {
+        match register_openaction_device(oa, device).await {
+            Ok(()) => {
+                log::info!("[MOBILE] registerDevice sent attempt={} id={}", attempt + 1, opendeck_device_id(&device.fingerprint));
+                return Ok(());
+            }
+            Err(error) => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(100 * (attempt + 1) as u64)).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("registerDevice failed")))
+}
+
+async fn deregister_openaction_device(oa: &WsSink, device_id: &str) -> Result<()> {
+    log::info!("[OPENACTION] DEREGISTER_DEVICE_TX id={}", device_id);
+    send(oa, json!({"event":"deregisterDevice","payload":device_id})).await
+}
+
+pub fn spawn_openaction_reader(oa: WsSink, mut rx: tokio::sync::broadcast::Receiver<serde_json::Value>) {
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(value) => {
+                    match value["event"].as_str().unwrap_or("") {
+                        "setImage" => {
+                            let Some(device) = value["device"].as_str() else { continue; };
+                            if !device.starts_with("dm-") { continue; }
+                            let position = value["position"].as_u64().unwrap_or(0) as u8;
+                            let image = value["image"].as_str().map(str::to_owned);
+                            IMAGE_CACHE.write().await.entry(device.to_owned()).or_default().insert(position, image.clone());
+
+                            if let Err(error) = send_icon_to_mobile(device, position, image.as_deref()).await {
+                                log::debug!("[MOBILE] setImage failed for {device}: {error}");
+                            }
+                        }
+                        "willAppear" => {
+                            let Some(device) = value["device"].as_str() else { continue; };
+                            if !device.starts_with("dm-") { continue; }
+                            let position = value["context"]["position"]
+                                .as_u64()
+                                .map(|v| v as u8);
+                            // GenericInstancePayload carries coordinates rather than
+                            // position, so derive the keypad index for normal keys.
+                            let controller = value["payload"]["controller"].as_str().unwrap_or("Keypad");
+                            let pos = if controller == "Encoder" {
+                                position.unwrap_or(0)
+                            } else {
+                                let row = value["payload"]["coordinates"]["row"].as_u64().unwrap_or(0) as u8;
+                                let column = value["payload"]["coordinates"]["column"].as_u64().unwrap_or(0) as u8;
+                                let columns = STATE.read().await.devices.iter()
+                                    .find(|d| d.fingerprint == device.strip_prefix("dm-").unwrap_or_default())
+                                    .map(|d| d.columns.max(1))
+                                    .unwrap_or(DEFAULT_COLS);
+                                row.saturating_mul(columns).saturating_add(column)
+                            };
+                            let action = AppearedAction {
+                                action: value["action"].as_str().unwrap_or("").to_owned(),
+                                title: value["payload"]["title"].as_str().unwrap_or("").to_owned(),
+                                name: value["action"].as_str().unwrap_or("").to_owned(),
+                                category: String::new(),
+                                controller: controller.to_owned(),
+                                state: value["payload"]["state"].as_u64().unwrap_or(0) as u16,
+                            };
+                            APPEARANCES.write().await.entry(device.to_owned()).or_default().insert(pos, action);
+                            log::debug!("[MOBILE] willAppear cached device={} position={} action={}", device, pos, value["action"].as_str().unwrap_or(""));
+                        }
+                        "willDisappear" => {
+                            let Some(device) = value["device"].as_str() else { continue; };
+                            if !device.starts_with("dm-") { continue; }
+                            let controller = value["payload"]["controller"].as_str().unwrap_or("Keypad");
+                            let row = value["payload"]["coordinates"]["row"].as_u64().unwrap_or(0) as u8;
+                            let column = value["payload"]["coordinates"]["column"].as_u64().unwrap_or(0) as u8;
+                            let pos = if controller == "Encoder" {
+                                column
+                            } else {
+                                let columns = STATE.read().await.devices.iter()
+                                    .find(|d| d.fingerprint == device.strip_prefix("dm-").unwrap_or_default())
+                                    .map(|d| d.columns.max(1))
+                                    .unwrap_or(DEFAULT_COLS);
+                                row.saturating_mul(columns).saturating_add(column)
+                            };
+                            if let Some(map) = APPEARANCES.write().await.get_mut(device) {
+                                map.remove(&pos);
+                            }
+                        }
+                        "showSettingsInterface" => {
+                            log::info!("[UI] OpenDeck requested Stream Deck Mobile management interface");
+                            crate::ui::spawn_settings_window();
+                        }
+                        "keyDown" => {
+                            // No-op: this plugin no longer registers any of its own
+                            // draggable actions (the management window opens via
+                            // HasSettingsInterface/showSettingsInterface instead), so
+                            // OpenDeck should never actually send this for us.
+                        }
+                        "deviceDidConnect" | "deviceDidDisconnect" => {
+                            log::info!("[OPENACTION_RX] event={} device={} plugin={}",
+                                value["event"].as_str().unwrap_or(""),
+                                value["device"].as_str().or_else(|| value["payload"]["id"].as_str()).unwrap_or(""),
+                                value["plugin"].as_str().unwrap_or(""));
+                        }
+                        _ => {
+                            log::debug!("[OPENACTION_RX] unhandled event={}", value["event"].as_str().unwrap_or(""));
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+
+        let _ = oa;
+    });
+}
+
+async fn send_icon_to_mobile(device_id: &str, position: u8, data_url: Option<&str>) -> Result<()> {
+    let client = CLIENTS.read().await.get(device_id).cloned();
+    let Some(client) = client else { return Ok(()); };
+    let keypad = KEYPADS.read().await.get(device_id).cloned();
+    let image = encode_icon(data_url, keypad.as_ref())?;
+    let fingerprint = device_id.strip_prefix("dm-").unwrap_or(device_id);
+    let key = CLIENT_KEYS.read().await.get(fingerprint).cloned()
+        .ok_or_else(|| anyhow::anyhow!("missing client key"))?;
+    let peer = PublicKey::from(<[u8;32]>::try_from(key.as_slice()).map_err(|_| anyhow::anyhow!("invalid Mobile public key"))?);
+    let cipher = SalsaBox::new(&peer, &server_secret());
+
+    let msg = ServerMessage { payload: Some(server_message::Payload::Icon(Icon { index: position as u32, image: Some(image) })) };
+    let plaintext = msg.encode_to_vec();
+    let nonce = SalsaBox::generate_nonce(&mut OsRng);
+    let ciphertext = cipher.encrypt(&nonce, plaintext.as_slice()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let mut frame = Vec::with_capacity(24 + ciphertext.len());
+    frame.extend_from_slice(nonce.as_slice());
+    frame.extend_from_slice(&ciphertext);
+    client.tx.send(WsMessage::Binary(frame.into())).await?;
+    Ok(())
+}
+
+fn encode_icon(data_url: Option<&str>, keypad: Option<&KeypadConfig>) -> Result<Image> {
+    let target = keypad.and_then(|k| k.icon_size.as_ref()).map(|s| (s.width.max(1), s.height.max(1))).unwrap_or((144,144));
+    let format = keypad.and_then(|k| k.supported_icon_image_formats.iter().find_map(|v| ImageFormat::try_from(*v).ok()))
+        .unwrap_or(ImageFormat::Lz4);
+    let Some(data_url) = data_url else { return empty_icon(target, format); };
+    let (_, encoded) = data_url.split_once(',').ok_or_else(|| anyhow::anyhow!("invalid data url"))?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+    let img = image::load_from_memory(&bytes)?;
+    let resized = img.resize_exact(target.0, target.1, image::imageops::FilterType::Lanczos3);
+    let (width,height) = resized.dimensions();
+
+    match format {
+        ImageFormat::Lz4 | ImageFormat::Lzf | ImageFormat::Lzfse => {
+            let mut rgba = resized.to_rgba8();
+            for px in rgba.as_mut().chunks_exact_mut(4) {
+                px.swap(0,2);
+            }
+            Ok(Image {
+                format: ImageFormat::Lz4 as i32,
+                r#type: ImageType::Transparent as i32,
+                size: Some(Size{width,height}),
+                row_bytes: width*4,
+                image: lz4_flex::block::compress(rgba.as_raw())
+            })
+        }
+        ImageFormat::Png => {
+            let rgba = resized.to_rgba8();
+            let mut out = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut out).write_image(&rgba,width,height,image::ExtendedColorType::Rgba8)?;
+            Ok(Image{format:ImageFormat::Png as i32,r#type:ImageType::Transparent as i32,size:Some(Size{width,height}),row_bytes:width*4,image:out})
+        }
+        ImageFormat::Jpg => {
+            let rgb = resized.to_rgb8();
+            let mut out = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out,90).write_image(&rgb,width,height,image::ExtendedColorType::Rgb8)?;
+            Ok(Image{format:ImageFormat::Jpg as i32,r#type:ImageType::Opaque as i32,size:Some(Size{width,height}),row_bytes:width*3,image:out})
+        }
+        ImageFormat::Bmp | ImageFormat::Invalid => anyhow::bail!("unsupported image format")
+    }
+}
+
+fn empty_icon(target:(u32,u32), format:ImageFormat)->Result<Image>{
+    match format{
+        ImageFormat::Lz4|ImageFormat::Lzf|ImageFormat::Lzfse=>{
+            let raw=vec![0u8;target.0 as usize*target.1 as usize*4];
+            Ok(Image{format:ImageFormat::Lz4 as i32,r#type:ImageType::Transparent as i32,size:Some(Size{width:target.0,height:target.1}),row_bytes:target.0*4,image:lz4_flex::block::compress(&raw)})
+        }
+        ImageFormat::Png=>{
+            let rgba=image::RgbaImage::from_pixel(target.0.max(2),target.1.max(2),image::Rgba([0,0,0,0]));
+            let (w,h)=rgba.dimensions(); let mut out=Vec::new();
+            image::codecs::png::PngEncoder::new(&mut out).write_image(&rgba,w,h,image::ExtendedColorType::Rgba8)?;
+            Ok(Image{format:ImageFormat::Png as i32,r#type:ImageType::Transparent as i32,size:Some(Size{width:w,height:h}),row_bytes:w*4,image:out})
+        }
+        ImageFormat::Jpg=>{
+            let rgb=image::RgbImage::from_pixel(target.0.max(2),target.1.max(2),image::Rgb([0,0,0]));
+            let (w,h)=rgb.dimensions(); let mut out=Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out,80).write_image(&rgb,w,h,image::ExtendedColorType::Rgb8)?;
+            Ok(Image{format:ImageFormat::Jpg as i32,r#type:ImageType::Opaque as i32,size:Some(Size{width:w,height:h}),row_bytes:w*3,image:out})
+        }
+        _=>anyhow::bail!("unsupported")
+    }
+}
+
+async fn handle_client(stream: TcpStream, peer: SocketAddr, legacy: bool, oa: WsSink) -> Result<()> {
+    let session_id = SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    log::info!("[MOBILE] websocket start peer={peer} legacy={legacy} session={session_id}");
+    let ws = tokio_tungstenite::accept_async(stream).await?;
+    let (mut write, mut read) = ws.split();
+    let (tx, mut rx) = mpsc::channel::<WsMessage>(256);
+
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if write.send(msg).await.is_err() { break; }
+        }
+    });
+
+    // Stream Deck Mobile may keep a discovery/authentication socket quiet for
+    // several seconds. Keep WebSocket transport alive without inventing VSD2
+    // application messages.
+    let heartbeat_tx = tx.clone();
+    let heartbeat = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            if heartbeat_tx.send(WsMessage::Ping(Vec::new().into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut fingerprint_current: Option<String> = None;
+    let mut active_device: Option<String> = None;
+
+    while let Some(message) = read.next().await {
+        match message? {
+            WsMessage::Binary(data) => {
+                raw_capture("RX", &peer.to_string(), "wire", data.as_ref());
+                let client = match ClientMessage::decode(data.as_ref()) {
+                    Ok(client) => client,
+                    Err(_) => {
+                        let Some(fp) = fingerprint_current.as_ref() else { continue; };
+                        log::debug!("[MOBILE] ENCRYPTED_CANDIDATE peer={} fingerprint={} bytes={}", peer, fp, data.len());
+                        let key = CLIENT_KEYS.read().await.get(fp).cloned();
+                        let Some(key) = key else {
+                            log::warn!("[MOBILE] ENCRYPTED_DROP peer={} fingerprint={} reason=no-client-key bytes={}", peer, fp, data.len());
+                            continue;
+                        };
+                        let peer_pk = PublicKey::from(<[u8;32]>::try_from(key.as_slice()).map_err(|_| anyhow::anyhow!("bad key"))?);
+                        let cipher = SalsaBox::new(&peer_pk, &server_secret());
+                        if data.len() < 40 {
+                            log::warn!("[MOBILE] ENCRYPTED_DROP peer={} fingerprint={} reason=frame-too-short bytes={}", peer, fp, data.len());
+                            continue;
+                        }
+                        let nonce = crypto_box::aead::generic_array::GenericArray::from_slice(&data[..24]);
+                        let plaintext = match cipher.decrypt(nonce, &data[24..]) {
+                            Ok(plaintext) => {
+                                log::info!("[MOBILE] ENCRYPTED_RX_DECRYPT_OK peer={} fingerprint={} frame_bytes={} plaintext_bytes={}", peer, fp, data.len(), plaintext.len());
+                                raw_capture("RX", &peer.to_string(), "decrypted", plaintext.as_slice());
+                                plaintext
+                            }
+                            Err(error) => {
+                                log::warn!("[MOBILE] ENCRYPTED_RX_DECRYPT_FAILED peer={} fingerprint={} frame_bytes={} error={:?}", peer, fp, data.len(), error);
+                                raw_capture("RX", &peer.to_string(), "encrypted-decrypt-failed", data.as_ref());
+                                continue;
+                            }
+                        };
+                        match ClientMessage::decode(plaintext.as_slice()) {
+                            Ok(client) => client,
+                            Err(error) => {
+                                log::warn!("[MOBILE] ENCRYPTED_RX_PROTOBUF_DECODE_FAILED peer={} fingerprint={} plaintext_bytes={} error={}", peer, fp, plaintext.len(), error);
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                log::info!("[MOBILE] CLIENT_MESSAGE_RX peer={} variant={}", peer, match &client.payload {
+                    Some(client_message::Payload::Hello(_)) => "Hello",
+                    Some(client_message::Payload::Authenticate(_)) => "Authenticate",
+                    Some(client_message::Payload::CancelAuthenticate(_)) => "CancelAuthenticate",
+                    Some(client_message::Payload::CreateVirtualDevice(_)) => "CreateVirtualDevice",
+                    Some(client_message::Payload::OpenVirtualDevice(_)) => "OpenVirtualDevice",
+                    Some(client_message::Payload::DeleteVirtualDevice(_)) => "DeleteVirtualDevice",
+                    Some(client_message::Payload::KeyPress(_)) => "KeyPress",
+                    Some(client_message::Payload::UpdateKeypadConfig(_)) => "UpdateKeypadConfig",
+                    Some(client_message::Payload::ClientCapabilities(_)) => "ClientCapabilities",
+                    None => "NONE(unrecognized-field-or-empty)",
+                });
+
+                match client.payload {
+                    Some(client_message::Payload::Authenticate(auth)) => {
+                        let Some(fp) = fingerprint_current.clone() else { log::warn!("[MOBILE] Authenticate received before Hello"); continue; };
+                        let already_trusted = AUTHENTICATED.read().await.contains(&fp);
+                        log::info!("[MOBILE] AUTHENTICATE_RX fingerprint={} request_id={} already_trusted={}", fp, auth.request_id, already_trusted);
+
+                        if already_trusted {
+                            // Duplicate/reconnect Authenticate must never create a new
+                            // pairing transaction. Match the working reference: OK + VDL.
+                            send_encrypted(&tx, &fp, ok(auth.request_id)).await?;
+                            send_vdl(&tx, &fp).await?;
+                            log::info!("[MOBILE] AUTHENTICATE_REPLAY_OK fingerprint={} request_id={} vdl_sent=true", fp, auth.request_id);
+                            continue;
+                        }
+
+                        {
+                            let mut pending = PENDING.write().await;
+                            let already_pending = pending.contains_key(&fp);
+                            let name = CLIENT_NAMES.read().await.get(&fp).cloned().unwrap_or_else(|| MOBILE_NAME.into());
+                            let entry = pending.entry(fp.clone()).or_insert_with(|| PendingPairing {
+                                fingerprint: fp.clone(),
+                                name,
+                                peer: peer.to_string(),
+                                approved: false,
+                            });
+                            entry.peer = peer.to_string();
+
+                            // Only spawn a fresh approval window the first time this
+                            // identity asks to pair. A duplicate/retried Authenticate
+                            // from the same still-pending fingerprint must not pop up
+                            // a second window on top of the one already open.
+                            if !already_pending {
+                                log::info!("[PAIRING_APPROVAL_POPUP] source=AUTHENTICATE fingerprint={} peer={} request_id={}", fp, peer, auth.request_id);
+                                ui::spawn_approval_process(&entry.fingerprint, &entry.name, &entry.peer);
+                            }
+                        }
+
+                        let approved = tokio::time::timeout(Duration::from_secs(120), async {
+                            loop {
+                                if let Some(p) = PENDING.read().await.get(&fp).cloned() {
+                                    if p.approved {
+                                        break true;
+                                    }
+                                } else if AUTHENTICATED.read().await.contains(&fp) {
+                                    // Idempotent reconnect after a successful commit.
+                                    break true;
+                                }
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }).await.unwrap_or(false);
+
+                        if !approved {
+                            let response = error_response(auth.request_id, ErrorCode::AuthenticationRejected, "Desktop did not approve pairing");
+                            send_encrypted(&tx,&fp,response).await?;
+                            PENDING.write().await.remove(&fp);
+                            continue;
+                        }
+
+                        // Only one parallel Authenticate is allowed to perform the
+                        // trust transition. Other sockets reuse the already-trusted state.
+                        let _trust_guard = TRUST_COMMIT_LOCK.lock().await;
+                        if AUTHENTICATED.read().await.contains(&fp) {
+                            send_encrypted(&tx, &fp, ok(auth.request_id)).await?;
+                            send_vdl(&tx, &fp).await?;
+                            log::info!("[MOBILE] AUTHENTICATE_POST_APPROVAL_RACE fingerprint={} request_id={} vdl_sent=true", fp, auth.request_id);
+                            PENDING.write().await.remove(&fp);
+                            continue;
+                        }
+
+                        let key = CLIENT_KEYS.read().await.get(&fp).cloned()
+                            .ok_or_else(|| anyhow::anyhow!("No public key for approved Mobile {fp}"))?;
+                        let name = CLIENT_NAMES.read().await.get(&fp).cloned()
+                            .unwrap_or_else(|| MOBILE_NAME.into());
+
+                        // Commit trust only after the protected Authenticate has
+                        // been received and the desktop approval is already set.
+                        // This is the "first pairing does two independent things at
+                        // once" moment: trusted_keys records the phone as trusted
+                        // (permanently — nothing besides the phone getting a new
+                        // identity ever removes it), and `devices` separately gets a
+                        // fresh virtual device.
+                        {
+                            let mut state = STATE.write().await;
+                            let key_b64 = base64::engine::general_purpose::STANDARD.encode(&key);
+                            state.trusted_keys.insert(fp.clone(), key_b64.clone());
+                            if let Some(device) = state.devices.iter_mut().find(|d| d.fingerprint == fp) {
+                                device.public_key_b64 = key_b64;
+                                device.name = name.clone();
+                            if device.vsd2_id.is_none() {
+                                device.vsd2_id = Some(vsd2_device_id(&fp));
+                            }
+                        } else {
+                                state.devices.push(SavedDevice {
+                                    fingerprint: fp.clone(),
+                                    public_key_b64: key_b64,
+                                    name: name.clone(),
+                                    rows: DEFAULT_ROWS,
+                                    columns: DEFAULT_COLS,
+                                    vsd2_id: None,
+                                });
+                            }
+                            state.save()?;
+                        }
+
+                        AUTHENTICATED.write().await.insert(fp.clone());
+                        let device = SavedDevice {
+                            fingerprint: fp.clone(),
+                            public_key_b64: base64::engine::general_purpose::STANDARD.encode(&key),
+                            name: name.clone(),
+                            rows: DEFAULT_ROWS,
+                            columns: DEFAULT_COLS,
+                            vsd2_id: None,
+                        };
+                        register_openaction_device_retry(&oa, &device).await?;
+                        log::info!("[MOBILE] TRUST_COMMIT fingerprint={} device_id={} authenticated=true", fp, opendeck_device_id(&fp));
+                        // The Approval window is a separate process that exits on its
+                        // own once Approve/Reject is sent — nothing to close here.
+
+                        let ok_message = ok(auth.request_id);
+                        send_encrypted(&tx, &fp, ok_message).await?;
+                        // Critical VSD2 lifecycle step: the reference immediately sends
+                        // the encrypted VirtualDeviceList on this authenticated socket.
+                        send_vdl(&tx, &fp).await?;
+                        log::info!("[MOBILE] PAIRING_COMPLETE fingerprint={} request_id={} trust committed; Authenticate OK + VDL sent; awaiting OpenVirtualDevice", fp, auth.request_id);
+                        PENDING.write().await.remove(&fp);
+                    }
+
+                    Some(client_message::Payload::CancelAuthenticate(cancel)) => {
+                        if let Some(p)=fingerprint_current.as_ref(){ PENDING.write().await.remove(p);}
+                        send_encrypted(&tx,&fingerprint_current.clone().unwrap_or_default(),error_response(cancel.request_id,ErrorCode::Cancelled,"Authentication cancelled")).await?;
+                    }
+
+                    Some(client_message::Payload::Hello(hello)) => {
+                        if hello.public_key.len()!=32 { anyhow::bail!("invalid public key"); }
+                        let fp=fingerprint(&hello.public_key);
+                        fingerprint_current=Some(fp.clone());
+                        CLIENT_KEYS.write().await.insert(fp.clone(),hello.public_key.clone());
+                        let client_name = hello.client_information.as_ref().map(|i| i.name.clone()).filter(|n| !n.trim().is_empty()).unwrap_or_else(|| MOBILE_NAME.into());
+                        CLIENT_NAMES.write().await.insert(fp.clone(), client_name);
+
+                        DISCOVERY_CLIENTS
+                            .write()
+                            .await
+                            .entry(fp.clone())
+                            .or_default()
+                            .insert(session_id, tx.clone());
+
+                        let already=AUTHENTICATED.read().await.contains(&fp);
+                        let device = if already { Some(opendeck_device_id(&fp)) } else { None };
+                        log::info!("[MOBILE] HELLO_RX peer={} fingerprint={} trusted={} device={:?}", peer, fp, already, device);
+
+                        let server_hello=HelloFromServer{
+                            workstation_id:workstation_id(),
+                            hostname:hostname(),
+                            version:VSD2_SERVER_VERSION.into(),
+                            protocol_version:2,
+                            public_key:server_public_key(),
+                            client_needs_authentication:!already,
+                            os_name:Some(std::env::consts::OS.into()),
+                            os_version:None,
+                            endpoints:Some(ServiceEndpoints{addresses:vec![local_ipv4().unwrap_or(Ipv4Addr::LOCALHOST).to_string()],port:PORT as u32}),
+                        };
+                        tx.send(WsMessage::Binary(ServerMessage{payload:Some(server_message::Payload::Hello(server_hello))}.encode_to_vec().into())).await?;
+
+                        if already {
+                            if legacy {
+                                send_vdl_plain(&tx, &fp).await?;
+                            }
+                            send_vdl(&tx, &fp).await?;
+                        } else {
+                            // The reference implementation sends nothing further here:
+                            // an unauthenticated discovery socket gets HelloFromServer
+                            // and then silence until the client sends (or the socket
+                            // gets) Authenticate. An earlier version of this plugin sent
+                            // an extra unsolicited *plaintext* empty VirtualDeviceList to
+                            // the still-unauthenticated client at this point, believing
+                            // it matched the reference — it does not, and receiving a VDL
+                            // on a socket that hasn't authenticated yet is very likely
+                            // what was making Mobile flash an unexpected error right after
+                            // scanning, even though the desktop still got its approval
+                            // popup (that comes from the separate, correctly-handled
+                            // Authenticate path).
+                            log::info!(
+                                "[MOBILE] untrusted Mobile {} discovery socket ready; waiting for encrypted Authenticate",
+                                fp
+                            );
+                        }
+
+                        log::info!("[MOBILE] Hello fingerprint={fp} trusted={already} device={device:?}");
+                        log::info!("[MOBILE] HELLO_TX_DETAILS fingerprint={} vsd2_version={} protocol_version=2 needs_auth={} endpoint_port={} legacy_port={}", fp, VSD2_SERVER_VERSION, !already, PORT, LEGACY_PORT);
+                    }
+
+                    Some(client_message::Payload::CreateVirtualDevice(create)) => {
+                        let Some(fp) = fingerprint_current.as_ref() else {
+                            log::warn!("[MOBILE] CreateVirtualDevice received before Hello request_id={}", create.request_id);
+                            continue;
+                        };
+                        if !AUTHENTICATED.read().await.contains(fp) {
+                            send_encrypted(&tx, fp, error_response(create.request_id, ErrorCode::AuthenticationRejected, "Mobile identity is not trusted")).await?;
+                            continue;
+                        }
+
+                        let id = opendeck_device_id(fp);
+                        let (rows, cols) = create.keypad_config.as_ref()
+                            .and_then(|cfg| cfg.layout_crop.as_ref())
+                            .map(|s| (s.height.clamp(1,255) as u8, s.width.clamp(1,255) as u8))
+                            .unwrap_or((DEFAULT_ROWS, DEFAULT_COLS));
+                        let name = if create.name.trim().is_empty() { saved_name(fp).await } else { create.name.clone() };
+
+                        {
+                            let mut state = STATE.write().await;
+                            if let Some(device) = state.devices.iter_mut().find(|d| d.fingerprint == *fp) {
+                                device.name = name.clone();
+                                device.rows = rows;
+                                device.columns = cols;
+                                if device.vsd2_id.is_none() {
+                                    device.vsd2_id = Some(vsd2_device_id(fp));
+                                }
+                            } else {
+                                let key = CLIENT_KEYS.read().await.get(fp).cloned().unwrap_or_default();
+                                state.devices.push(SavedDevice {
+                                    fingerprint: fp.clone(),
+                                    public_key_b64: base64::engine::general_purpose::STANDARD.encode(&key),
+                                    name: name.clone(),
+                                    rows,
+                                    columns: cols,
+                                    vsd2_id: None,
+                                });
+                            }
+                            state.save()?;
+                        }
+
+                        let device = STATE.read().await.devices.iter().find(|d| d.fingerprint == *fp).cloned()
+                            .ok_or_else(|| anyhow::anyhow!("Mobile device disappeared during CreateVirtualDevice"))?;
+                        register_openaction_device_retry(&oa, &device).await?;
+                        update_device_registration(&oa, &id, rows, cols).await?;
+                        remember_keypad(&id, create.keypad_config.clone()).await;
+                        active_device = Some(id.clone());
+                        CLIENTS.write().await.insert(id.clone(), ClientHandle { tx: tx.clone(), session_id });
+
+                        // The reference Mobile client treats VirtualDeviceOpened itself as
+                        // the CreateVirtualDevice acknowledgement. A separate leading Ok
+                        // response for the same request_id confuses its request/response
+                        // matching and the app stalls for ~20s before resetting the socket.
+                        send_encrypted(&tx, fp, ServerMessage {
+                            payload: Some(server_message::Payload::VirtualDeviceOpened(VirtualDeviceOpened {
+                                request_id: create.request_id,
+                                device: Some(VirtualDevice { id: ensure_vsd2_id(fp).await, name: name.clone() })
+                            }))
+                        }).await?;
+                        let actions = build_mobile_context_actions(&id, rows, cols).await;
+                        send_encrypted(&tx, fp, ServerMessage {
+                            payload: Some(server_message::Payload::Context(Context {
+                                profile_id: "opendeck-mobile-profile".into(),
+                                total_pages: 1,
+                                current_page: 0,
+                                actions
+                            }))
+                        }).await?;
+                        replay_cached(&tx, fp, &id).await?;
+                        log::info!("[MOBILE] CREATE_VIRTUAL_DEVICE_RX request_id={} device_id={} rows={} cols={} opened=true", create.request_id, id, rows, cols);
+                    }
+
+                    Some(client_message::Payload::OpenVirtualDevice(open)) => {
+                        log::info!(
+                            "[MOBILE] OPEN_VIRTUAL_DEVICE_RX peer={} request_id={} device_id={} has_keypad_config={}",
+                            peer, open.request_id, open.device_id, open.keypad_config.is_some()
+                        );
+                        let Some(fp)=fingerprint_current.as_ref() else {
+                            log::warn!("[MOBILE] OpenVirtualDevice received before Hello");
+                            continue;
+                        };
+                        if !AUTHENTICATED.read().await.contains(fp) {
+
+                            log::warn!(
+                                "[MOBILE] OpenVirtualDevice rejected: untrusted fingerprint={} request_id={}",
+                                fp, open.request_id
+                            );
+                            send_encrypted(
+                                &tx,
+                                fp,
+                                error_response(open.request_id, ErrorCode::AuthenticationRejected, "Mobile identity is not trusted")
+                            ).await?;
+                            continue;
+                        }
+
+                        let open_id = ensure_vsd2_id(fp).await;
+                        if open.device_id != open_id {
+                            log::warn!(
+                                "[MOBILE] OpenVirtualDevice unknown device: requested={} expected={} fingerprint={}",
+                                open.device_id, open_id, fp
+                            );
+                            send_encrypted(
+                                &tx,
+                                fp,
+                                error_response(open.request_id, ErrorCode::DeviceNotFound, "Virtual device ID is not registered for this Mobile identity")
+                            ).await?;
+                            continue;
+                        }
+
+                        let (rows,cols)=open.keypad_config.as_ref().and_then(|c|c.layout_crop.as_ref()).map(|s|(s.height.clamp(1,255) as u8,s.width.clamp(1,255) as u8)).unwrap_or((DEFAULT_ROWS,DEFAULT_COLS));
+                        let id=opendeck_device_id(fp);
+
+                        {
+                            let mut state=STATE.write().await;
+                            if let Some(d)=state.devices.iter_mut().find(|d|d.fingerprint==*fp) {
+                                d.rows=rows; d.columns=cols;
+                            } else {
+                                // Trusted, but no virtual device is currently registered
+                                // — it may have been deleted from either side, or this is
+                                // Mobile's own "known device" reconnect rather than a
+                                // fresh pairing. Recreate it: trust and the virtual
+                                // device are independent, so this must not require
+                                // going through Authenticate again.
+                                let key_b64 = state.trusted_keys.get(fp).cloned().unwrap_or_default();
+                                let name = CLIENT_NAMES.read().await.get(fp).cloned().unwrap_or_else(|| MOBILE_NAME.into());
+                                state.devices.push(SavedDevice {
+                                    fingerprint: fp.clone(),
+                                    public_key_b64: key_b64,
+                                    name,
+                                    rows, columns: cols,
+                                    vsd2_id: Some(open_id.clone()),
+                                });
+                            }
+                            state.save()?;
+                        }
+                        update_device_registration(&oa,&id,rows,cols).await?;
+                        remember_keypad(&id,open.keypad_config.clone()).await;
+                        active_device=Some(id.clone());
+                        CLIENTS.write().await.insert(id.clone(), ClientHandle { tx: tx.clone(), session_id });
+                        log::info!("[MOBILE] SESSION_ATTACHED fingerprint={} device_id={}", fp, id);
+
+                        send_encrypted(&tx,fp,ServerMessage{payload:Some(server_message::Payload::VirtualDeviceOpened(VirtualDeviceOpened{
+                            request_id:open.request_id,
+                            device:Some(VirtualDevice{id:open_id.clone(),name:saved_name(fp).await})
+                        }))}).await?;
+                        if open.keypad_config.is_some() {
+                            let actions = build_mobile_context_actions(&id, rows, cols).await;
+                            send_encrypted(&tx,fp,ServerMessage{payload:Some(server_message::Payload::Context(Context{
+                                profile_id:"opendeck-mobile-profile".into(), total_pages:1, current_page:0, actions
+                            }))}).await?;
+                        }
+                        replay_cached(&tx,fp,&id).await?;
+                    }
+
+                    Some(client_message::Payload::UpdateKeypadConfig(update)) => {
+                        if let Some(id)=active_device.as_ref() {
+                            apply_keypad_update(id,&update).await;
+                            if let Some(size)=update.layout_crop {
+                                let rows=size.height.clamp(1,255) as u8;
+                                let cols=size.width.clamp(1,255) as u8;
+                                update_device_registration(&oa,id,rows,cols).await?;
+                                if let Some(fp)=fingerprint_current.as_ref() {
+                                    let _=send(&oa,json!({"event":"rerenderImages","payload":id})).await;
+                                    let _=persist_layout(fp,rows,cols).await;
+                                }
+                            }
+                        }
+                    }
+
+                    Some(client_message::Payload::KeyPress(key)) => {
+                        if let Some(id)=active_device.as_ref() {
+                            log::debug!(
+                                "[MOBILE] KEYPRESS_RX device={} index={} pressed={}",
+                                id, key.index, key.pressed
+                            );
+                            send_key_to_openaction(&oa,id,key.index,key.pressed).await?;
+                        }
+                    }
+
+                    Some(client_message::Payload::ClientCapabilities(capabilities)) => {
+                        log::info!(
+                            "[MOBILE] CLIENT_CAPABILITIES_RX fingerprint={} is_user_pro={}; resending VDL",
+                            fingerprint_current.as_deref().unwrap_or(""),
+                            capabilities.is_user_pro
+                        );
+                        if let Some(fp) = fingerprint_current.as_ref() {
+                            if AUTHENTICATED.read().await.contains(fp) {
+                                send_vdl(&tx, fp).await?;
+                            }
+                        }
+                    }
+
+                    Some(client_message::Payload::DeleteVirtualDevice(delete)) => {
+                        // A virtual device and the Mobile identity's pairing/trust are
+                        // two different things, and conflating them was a mistake:
+                        // deleting the device must never revoke trust. Reuse the same
+                        // `remove_device` the desktop "Remove" button calls — it only
+                        // touches the device (deregisters from OpenDeck, forgets the
+                        // saved layout/name) and leaves trust alone, so the phone stays
+                        // a known, trusted workstation and its "known device" reconnect
+                        // keeps working afterward. Reply first: `remove_device` closes
+                        // every discovery socket for this fingerprint, including this
+                        // very one, and nothing may be sent on a socket after that.
+                        active_device = None;
+                        send_encrypted(&tx, fingerprint_current.as_deref().unwrap_or_default(), ok(delete.request_id)).await?;
+                        if let Some(fp) = fingerprint_current.clone() {
+                            log::info!("[MOBILE] DELETE_VIRTUAL_DEVICE_RX fingerprint={} request_id={} -> removing virtual device (trust unaffected)", fp, delete.request_id);
+                            let _ = remove_device(&fp, &oa).await;
+                        }
+                    }
+
+                    _ => {}
+                }
+            }
+            WsMessage::Ping(p)=>{ tx.send(WsMessage::Pong(p)).await?; }
+            WsMessage::Close(_)=>break,
+            _=>{}
+        }
+    }
+
+    if let Some(fp) = fingerprint_current.as_ref() {
+        let mut discovery = DISCOVERY_CLIENTS.write().await;
+        if let Some(sessions) = discovery.get_mut(fp) {
+            sessions.remove(&session_id);
+            if sessions.is_empty() { discovery.remove(fp); }
+        }
+    }
+
+    if let Some(id) = active_device.as_ref() {
+        let mut clients = CLIENTS.write().await;
+        if clients.get(id).map(|client| client.session_id) == Some(session_id) {
+            clients.remove(id);
+            log::info!("[MOBILE] SESSION_DETACHED device_id={} session={}", id, session_id);
+        } else {
+            log::debug!("[MOBILE] SESSION_OLD_SOCKET_CLOSED device_id={} session={}", id, session_id);
+        }
+    }
+    heartbeat.abort();
+    writer.abort();
+    Ok(())
+}
+
+
+async fn build_mobile_context_actions(device_id: &str, rows: u8, cols: u8) -> Vec<Action> {
+    let total = u32::from(rows) * u32::from(cols);
+    let appearances = APPEARANCES.read().await.get(device_id).cloned().unwrap_or_default();
+    (0..total)
+        .map(|index| {
+            let position = index as u8;
+            if let Some(item) = appearances.get(&position) {
+                Action {
+                    index,
+                    title: item.title.clone(),
+                    name: item.name.clone(),
+                    category: item.category.clone(),
+                    shortcut_id: None,
+                }
+            } else {
+                Action {
+                    index,
+                    title: String::new(),
+                    name: String::new(),
+                    category: String::new(),
+                    shortcut_id: None,
+                }
+            }
+        })
+        .collect()
+}
+
+async fn saved_name(fp:&str)->String{
+    STATE.read().await.devices.iter().find(|d|d.fingerprint==fp).map(|d|d.name.clone()).unwrap_or_else(||MOBILE_NAME.into())
+}
+
+async fn send_empty_vdl_to_discovery(fp: &str) -> Result<()> {
+    let key = CLIENT_KEYS.read().await.get(fp).cloned();
+    let Some(key) = key else { return Ok(()); };
+    let peer_pk = PublicKey::from(<[u8;32]>::try_from(key.as_slice()).map_err(|_| anyhow::anyhow!("bad client key"))?);
+    let cipher = SalsaBox::new(&peer_pk, &server_secret());
+    let msg = ServerMessage {
+        payload: Some(server_message::Payload::VirtualDeviceList(VirtualDeviceList { devices: Vec::new() })),
+    };
+    let plaintext = msg.encode_to_vec();
+    let nonce = SalsaBox::generate_nonce(&mut OsRng);
+    let ciphertext = cipher.encrypt(&nonce, plaintext.as_slice()).map_err(|e| anyhow::anyhow!("encrypt empty VDL: {e:?}"))?;
+    let mut frame = Vec::with_capacity(24 + ciphertext.len());
+    frame.extend_from_slice(nonce.as_slice());
+    frame.extend_from_slice(&ciphertext);
+
+    let sockets = DISCOVERY_CLIENTS.read().await.get(fp).cloned().unwrap_or_default();
+    for (_session, tx) in sockets {
+        let _ = tx.send(WsMessage::Binary(frame.clone().into())).await;
+    }
+    log::info!("[MOBILE] EMPTY_VDL_SENT fingerprint={} discovery_sockets={}", fp, DISCOVERY_CLIENTS.read().await.get(fp).map(|m| m.len()).unwrap_or(0));
+    Ok(())
+}
+
+async fn refresh_trusted_discovery(fp: &str) -> Result<()> {
+    // Pairing may leave a separate discovery socket with the old
+    // clientNeedsAuthentication=true state. Force those sockets to reconnect
+    // so Mobile starts a fresh trusted discovery session.
+    let sockets = DISCOVERY_CLIENTS.read().await.get(fp).cloned().unwrap_or_default();
+    let count = sockets.len();
+    for (_session_id, tx) in sockets {
+        let _ = tx.send(WsMessage::Close(None)).await;
+    }
+    log::info!("[MOBILE] TRUST_DISCOVERY_RECONNECT fingerprint={} sockets_closed={}", fp, count);
+    Ok(())
+}
+
+async fn send_live_vdl(fp:&str, devices: Vec<VirtualDevice>) -> Result<()> {
+    let key = CLIENT_KEYS.read().await.get(fp).cloned().ok_or_else(|| anyhow::anyhow!("missing client key for {fp}"))?;
+    let peer_pk = PublicKey::from(<[u8;32]>::try_from(key.as_slice()).map_err(|_| anyhow::anyhow!("bad client key length"))?);
+    let cipher = SalsaBox::new(&peer_pk, &server_secret());
+    let msg = ServerMessage {
+        payload: Some(server_message::Payload::VirtualDeviceList(VirtualDeviceList { devices })),
+    };
+    let nonce = SalsaBox::generate_nonce(&mut OsRng);
+    let plaintext = msg.encode_to_vec();
+    let ciphertext = cipher.encrypt(&nonce, plaintext.as_slice()).map_err(|e| anyhow::anyhow!("encrypt VDL: {e:?}"))?;
+    let mut frame = Vec::with_capacity(24 + ciphertext.len());
+    frame.extend_from_slice(nonce.as_slice());
+    frame.extend_from_slice(&ciphertext);
+
+    let mut targets = Vec::new();
+    if let Some(client) = CLIENTS.read().await.get(&opendeck_device_id(fp)).cloned() {
+        targets.push(client.tx);
+    }
+    if let Some(sessions) = DISCOVERY_CLIENTS.read().await.get(fp) {
+        targets.extend(sessions.values().cloned());
+    }
+    for tx in targets {
+        let _ = tx.send(WsMessage::Binary(frame.clone().into())).await;
+    }
+    Ok(())
+}
+
+async fn persist_layout(fp:&str,rows:u8,cols:u8)->Result<()>{
+    let mut state=STATE.write().await;
+    if let Some(d)=state.devices.iter_mut().find(|d|d.fingerprint==fp){
+        d.rows=rows; d.columns=cols; state.save()?;
+    }
+    Ok(())
+}
+
+async fn update_device_registration(oa:&WsSink,id:&str,rows:u8,cols:u8)->Result<()> {
+    let name = {
+        let state = STATE.read().await;
+        state.devices.iter()
+            .find(|d| opendeck_device_id(&d.fingerprint) == id)
+            .map(|d| d.name.clone())
+            .unwrap_or_else(|| MOBILE_NAME.to_owned())
+    };
+
+    // OpenDeck only sizes a device's profile key storage the first time that
+    // device+profile pair is loaded into its in-memory cache (Store::new +
+    // keys.resize). A later registerDevice for an already-registered device
+    // is treated purely as a metadata upsert: the DeviceInfo (and thus the
+    // rendered grid) does pick up the new rows/columns, but the underlying
+    // key storage keeps its old length, so any position at/after the old
+    // rows*columns silently fails to accept an action — the grid *looks*
+    // bigger but only the original slot count is actually usable. OpenDeck's
+    // own bundled Stream Deck Mobile support hits the exact same thing and
+    // works around it by deregistering before re-registering with new
+    // dimensions, which forces the cache to be dropped and rebuilt at the new
+    // size. Only do that when the size actually changed — every "known
+    // device" reconnect calls this with the same saved rows/cols, and a
+    // deregister/register cycle there would flicker the device for no reason.
+    let previous = REGISTERED_DEVICE_SIZE.read().await.get(id).copied();
+    if previous.is_some_and(|prev| prev != (rows, cols)) {
+        log::info!("[MOBILE] DEVICE_RESIZE id={} {:?} -> {}x{}; deregistering first so OpenDeck resizes its profile storage", id, previous, rows, cols);
+        let _ = deregister_openaction_device(oa, id).await;
+    }
+
+    log::info!("[MOBILE] DEVICE_LAYOUT_UPDATE id={} -> {}x{}", id, rows, cols);
+    send(oa,json!({"event":"registerDevice","payload":{"id":id,"name":name,"rows":rows,"columns":cols,"encoders":0,"touchpoints":0,"infobars":0,"type":3}})).await?;
+    REGISTERED_DEVICE_SIZE.write().await.insert(id.to_owned(), (rows, cols));
+    let _ = send(oa,json!({"event":"rerenderImages","payload":id})).await;
+    Ok(())
+}
+
+async fn replay_cached(tx:&mpsc::Sender<WsMessage>,fp:&str,id:&str)->Result<()>{
+    let entries=IMAGE_CACHE.read().await.get(id).cloned().unwrap_or_default();
+    for (pos,img) in entries {
+        send_icon_to_mobile(id,pos,img.as_deref()).await?;
+    }
+    let _=tx;
+    let _=fp;
+    Ok(())
+}
+
+async fn send_key_to_openaction(oa:&WsSink,device:&str,index:u32,pressed:bool)->Result<()>{
+    send(oa,json!({"event":if pressed{"keyDown"}else{"keyUp"},"payload":{"device":device,"position":index}})).await
+}
+
+async fn remember_keypad(id:&str,cfg:Option<KeypadConfig>){
+    if let Some(cfg)=cfg { KEYPADS.write().await.insert(id.into(),cfg); }
+}
+
+async fn apply_keypad_update(id:&str,update:&UpdateKeypadConfig){
+    let mut map=KEYPADS.write().await;
+    let cfg=map.entry(id.into()).or_insert_with(default_keypad_config);
+    if update.icon_size.is_some(){cfg.icon_size=update.icon_size.clone();}
+    if update.pressed_icon_size.is_some(){cfg.pressed_icon_size=update.pressed_icon_size.clone();}
+    if update.high_dpi.is_some(){cfg.high_dpi=update.high_dpi.unwrap();}
+    if update.layout_crop.is_some(){cfg.layout_crop=update.layout_crop.clone();}
+}
+
+async fn send_encrypted(tx:&mpsc::Sender<WsMessage>,fp:&str,msg:ServerMessage)->Result<()>{
+    let key=CLIENT_KEYS.read().await.get(fp).cloned().ok_or_else(||anyhow::anyhow!("missing key"))?;
+    let pk=PublicKey::from(<[u8;32]>::try_from(key.as_slice()).map_err(|_|anyhow::anyhow!("bad key"))?);
+    let cipher=SalsaBox::new(&pk,&server_secret());
+    let nonce=SalsaBox::generate_nonce(&mut OsRng);
+    let plaintext=msg.encode_to_vec();
+    raw_capture("TX", fp, "plaintext-server-message", plaintext.as_slice());
+    let ciphertext=cipher.encrypt(&nonce,plaintext.as_slice()).map_err(|e|anyhow::anyhow!("{e:?}"))?;
+    let mut frame=Vec::with_capacity(24+ciphertext.len());
+    frame.extend_from_slice(nonce.as_slice());
+    frame.extend_from_slice(&ciphertext);
+    raw_capture("TX", fp, "encrypted-server-message", &frame);
+    tx.send(WsMessage::Binary(frame.into())).await?;
+    Ok(())
+}
+
+async fn build_vdl(fp: &str) -> Result<VirtualDeviceList> {
+    // Trust no longer implies a virtual device exists (see PersistedState) —
+    // a trusted phone that deleted its device, or has never created one yet,
+    // must see an empty list, not a phantom entry for a device that was
+    // never actually registered with OpenDeck. Advertising one unconditionally
+    // here is exactly what made a deleted device reappear (as a real,
+    // freshly-created device) the moment Mobile tried to open it again.
+    if !STATE.read().await.devices.iter().any(|d| d.fingerprint == fp) {
+        log::info!("[MOBILE] VIRTUAL_DEVICE_LIST_BUILD fingerprint={} -> empty (trusted, no virtual device)", fp);
+        return Ok(VirtualDeviceList { devices: Vec::new() });
+    }
+    let name = saved_name(fp).await;
+    let id = ensure_vsd2_id(fp).await;
+    log::info!("[MOBILE] VIRTUAL_DEVICE_LIST_BUILD fingerprint={} vsd2_device_id={} opendeck_device_id={} name={:?}", fp, id, opendeck_device_id(fp), name);
+    Ok(VirtualDeviceList { devices: vec![VirtualDevice { id, name }] })
+}
+
+async fn send_vdl(tx: &mpsc::Sender<WsMessage>, fp: &str) -> Result<()> {
+    let list = build_vdl(fp).await?;
+    send_encrypted(tx, fp, ServerMessage { payload: Some(server_message::Payload::VirtualDeviceList(list)) }).await?;
+    log::info!("[MOBILE] VIRTUAL_DEVICE_LIST_TX fingerprint={} mode=encrypted devices=1", fp);
+    Ok(())
+}
+
+async fn send_vdl_plain(tx: &mpsc::Sender<WsMessage>, fp: &str) -> Result<()> {
+    let list = build_vdl(fp).await?;
+    let encoded = ServerMessage { payload: Some(server_message::Payload::VirtualDeviceList(list)) }.encode_to_vec();
+    tx.send(WsMessage::Binary(encoded.into())).await?;
+    log::info!("[MOBILE] VIRTUAL_DEVICE_LIST_TX fingerprint={} mode=plain-legacy devices=1", fp);
+    Ok(())
+}
+
+pub async fn start_vsd2(oa:WsSink)->Result<()>{
+    let legacy=TcpListener::bind(("0.0.0.0",LEGACY_PORT)).await?;
+    log::info!("[MOBILE] LEGACY_LISTEN owner=plugin addr=0.0.0.0:{}", LEGACY_PORT);
+
+    let v2=TcpListener::bind(("0.0.0.0",PORT)).await?;
+    log::info!("[MOBILE] VSD2_LISTEN owner=plugin addr=0.0.0.0:{}", PORT);
+
+    // `adb logcat` on a real device showed the current (Corsair-branded,
+    // post-Elgato-acquisition) Stream Deck Mobile build connecting purely
+    // from mDNS discovery ("source=ELGATO_DISCOVERY") exclusively to
+    // legacy_port+2 — never legacy_port+1 (our PORT/28198, which QR pairing
+    // uses and which does work). mDNS discovery itself was never the
+    // problem: the app found our host at the right address every time and
+    // just tried to open a websocket on a port nothing was listening on
+    // (`Connection refused` / connect timeout, repeated across every address
+    // avahi had published, e.g. 192.168.1.10:28199, 172.17.0.1:28199). Listen
+    // there too with the same VSD2 handling — if this build's discovery path
+    // speaks the same VSD2 protobuf framing (plausible; nothing else about
+    // the handshake looked different), this alone should fix Mobile's
+    // "known device"/network-search connect path.
+    let modern_port = PORT + 1;
+    let modern=TcpListener::bind(("0.0.0.0",modern_port)).await?;
+    log::info!("[MOBILE] VSD2_MODERN_LISTEN owner=plugin addr=0.0.0.0:{}", modern_port);
+    log::info!("[MOBILE] VSD2_READY");
+
+    tokio::spawn(async { run_mdns().await; });
+
+    tokio::spawn(async move {
+        loop{
+            tokio::select!{
+                r=legacy.accept()=>{
+                    match r {
+                        Ok((s,p)) => {
+                            let oa=oa.clone();
+                            tokio::spawn(async move {
+                                if let Err(e)=handle_client(s,p,true,oa).await {
+                                    log::warn!("[MOBILE] SESSION_ERROR legacy peer={}: {}", p, e);
+                                }
+                            });
+                        }
+                        Err(e)=>log::error!("[MOBILE] legacy accept failed: {e}")
+                    }
+                }
+                r=v2.accept()=>{
+                    match r {
+                        Ok((s,p)) => {
+                            log::info!("[MOBILE] VSD2_TCP_ACCEPT peer={}", p);
+                            let oa=oa.clone();
+                            tokio::spawn(async move {
+                                if let Err(e)=handle_client(s,p,false,oa).await {
+                                    log::warn!("[MOBILE] SESSION_ERROR vsd2 peer={}: {}", p, e);
+                                }
+                            });
+                        }
+                        Err(e)=>log::error!("[MOBILE] VSD2 accept failed: {e}")
+                    }
+                }
+                r=modern.accept()=>{
+                    match r {
+                        Ok((s,p)) => {
+                            log::info!("[MOBILE] VSD2_MODERN_TCP_ACCEPT peer={}", p);
+                            let oa=oa.clone();
+                            tokio::spawn(async move {
+                                if let Err(e)=handle_client(s,p,false,oa).await {
+                                    log::warn!("[MOBILE] SESSION_ERROR vsd2-modern peer={}: {}", p, e);
+                                }
+                            });
+                        }
+                        Err(e)=>log::error!("[MOBILE] VSD2 modern accept failed: {e}")
+                    }
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+async fn run_mdns() {
+    // The reference (tessttt) implementation runs avahi-publish-service *and*
+    // its own raw periodic multicast broadcaster at the same time,
+    // unconditionally — the raw one isn't a fallback for when avahi fails,
+    // it's always on. Our version had the raw broadcaster gated behind avahi
+    // actually failing to start, which it essentially never does on a normal
+    // Linux desktop (avahi-daemon is near-universal) — so this plugin's raw
+    // announcer had *never once* actually run in any of the testing that went
+    // into the other mDNS fixes here, no matter what else changed. avahi
+    // itself mostly only answers active queries once a service is
+    // registered, rather than continuing to broadcast unsolicited
+    // announcements the way this raw loop does every 10s; if Mobile's
+    // network-search screen is more of a passive listener for exactly that
+    // kind of repeated announcement than an active mDNS resolver like
+    // `avahi-browse`, avahi's own (perfectly spec-compliant) behavior alone
+    // would never satisfy it, regardless of which address is inside it. Run
+    // both, always, like the reference does.
+    tokio::spawn(run_mdns_raw());
+    run_mdns_avahi().await;
+}
+
+async fn run_mdns_avahi() {
+    let hostname_value = hostname();
+
+    //
+    // The address is baked into the TXT record (`a=`/`av2=`) as plain
+    // arguments at spawn time and avahi-publish-service never revisits them
+    // afterward. This function used to compute the IP exactly once, at
+    // startup, and then run avahi-publish-service unattended forever — so
+    // switching networks after the plugin started (even trivially, like
+    // moving the laptop to a phone hotspot mid-session) left it advertising a
+    // stale, unreachable address permanently: Mobile could still *see* the
+    // announcement, but the address inside it pointed nowhere useful. Loop
+    // here instead, periodically checking whether the local IPv4 changed,
+    // and restart avahi-publish-service with fresh TXT records when it has.
+    let mut last_ip: Option<Ipv4Addr> = None;
+    loop {
+        let Some(ip) = local_ipv4() else {
+            log::warn!("[MOBILE] mDNS advertisement disabled: no local IPv4 route found");
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            continue;
+        };
+        if last_ip.is_some_and(|prev| prev != ip) {
+            log::info!("[MOBILE] MDNS_IP_CHANGED old={} new={ip} -- republishing", last_ip.unwrap());
+        }
+        last_ip = Some(ip);
+
+        let txt = [
+            format!("id={}", workstation_id()),
+            format!("name={}", hostname_value),
+            format!("a={ip}:{LEGACY_PORT}"),
+            format!("av2={ip}:{PORT}"),
+            format!("t={}", pairing_token()),
+        ];
+
+        let mut publish_cmd = tokio::process::Command::new("avahi-publish-service");
+        publish_cmd
+            .arg("--no-fail")
+            .arg("-s")
+            .arg(&hostname_value)
+            .arg("_elg._tcp")
+            .arg(LEGACY_PORT.to_string())
+            .args(&txt)
+            .kill_on_drop(true);
+        // kill_on_drop() only fires on a clean async drop of the Child. If this
+        // plugin process is ever killed abruptly (SIGKILL, `pkill`, OpenDeck
+        // tearing down the plugin ungracefully during a restart — all things
+        // that happen routinely while iterating on this plugin), the child is
+        // orphaned and keeps holding this exact service name registered with
+        // avahi-daemon forever. Every later launch then collides with that
+        // name, avahi-daemon refuses the new registration, avahi-publish-service
+        // exits immediately, and we silently fall back to the raw publisher —
+        // this is exactly what was happening (stale avahi-publish-service
+        // processes from earlier kills were still running and blocking every
+        // subsequent registration). PR_SET_PDEATHSIG makes the kernel SIGTERM
+        // this child the moment its parent thread dies, regardless of how.
+        unsafe {
+            publish_cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let mut child = match publish_cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                log::info!("[MOBILE] avahi-publish-service unavailable ({error}); relying on the raw mDNS publisher alone");
+                return;
+            }
+        };
+        log::info!("[MOBILE] MDNS_AVAHI_STARTED service={hostname_value}._elg._tcp.local address={ip} legacy_port={LEGACY_PORT} vsd2_port={PORT}");
+
+        loop {
+            tokio::select! {
+                status = child.wait() => {
+                    log::warn!("[MOBILE] avahi-publish-service exited ({status:?}); republishing");
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_secs(15)) => {
+                    if local_ipv4() != Some(ip) {
+                        log::info!("[MOBILE] MDNS_IP_CHECK detected change while avahi-publish-service was running; restarting it");
+                        let _ = child.kill().await;
+                        break;
+                    }
+                }
+            }
+        }
+        // Loop around: re-read the (possibly new) IP and republish. This is
+        // also how a merely-crashed avahi-publish-service gets retried,
+        // instead of giving up on it forever after the first exit.
+    }
+}
+
+/// Runs unconditionally, always alongside avahi (see `run_mdns`) — matches
+/// the reference implementation's own always-on raw multicast announcer.
+async fn run_mdns_raw() {
+    let hostname_value = hostname();
+
+    // RFC 6762 says a legitimate mDNS responder's packets come from UDP port
+    // 5353; several real-world resolvers (including Android's) silently
+    // ignore announcements from any other source port. SO_REUSEADDR/SO_REUSEPORT
+    // are required because avahi-daemon (a system service, almost always
+    // running) already holds 5353 itself — this needs to coexist with it, not
+    // replace it.
+    let socket = match bind_mdns_source_port() {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("[MOBILE] raw mDNS socket bind to port 5353 failed ({e}); falling back to an ephemeral source port, which most resolvers will ignore");
+            match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("[MOBILE] raw mDNS socket bind failed: {e}");
+                    return;
+                }
+            }
+        }
+    };
+    let _ = socket.set_multicast_ttl_v4(255);
+    let _ = socket.set_multicast_loop_v4(true);
+    loop {
+        let service = format!("{}.{}", hostname_value, SERVICE_TYPE);
+        let host = format!("{}.local.", hostname_value.to_lowercase().replace(' ', "-"));
+        let ip = local_ipv4().unwrap_or(Ipv4Addr::LOCALHOST);
+        let packet = build_mdns_response(&service, &host, ip, LEGACY_PORT);
+        match socket.send_to(&packet, (Ipv4Addr::new(224, 0, 0, 251), 5353)) {
+            Ok(n) => log::info!("[MOBILE] MDNS_RAW_SENT bytes={n} service={service} ip={ip} port={LEGACY_PORT}"),
+            Err(e) => log::warn!("[MOBILE] MDNS_RAW_SEND_FAILED error={e}"),
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+}
+
+fn bind_mdns_source_port() -> std::io::Result<UdpSocket> {
+    use std::os::fd::FromRawFd;
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let set_opt = |name: libc::c_int| -> std::io::Result<()> {
+            let yes: libc::c_int = 1;
+            let ret = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                name,
+                &yes as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&yes) as libc::socklen_t,
+            );
+            if ret != 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+        };
+        if let Err(e) = set_opt(libc::SO_REUSEADDR).and_then(|_| set_opt(libc::SO_REUSEPORT)) {
+            libc::close(fd);
+            return Err(e);
+        }
+        let addr = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: 5353u16.to_be(),
+            sin_addr: libc::in_addr { s_addr: 0 },
+            sin_zero: [0; 8],
+        };
+        let ret = libc::bind(
+            fd,
+            &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        );
+        if ret != 0 {
+            let e = std::io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
+        }
+        Ok(UdpSocket::from_raw_fd(fd))
+    }
+}
+
+fn dns_name(name:&str,out:&mut Vec<u8>){
+    for label in name.trim_end_matches('.').split('.') { out.push(label.len() as u8); out.extend_from_slice(label.as_bytes()); }
+    out.push(0);
+}
+
+fn build_mdns_response(service:&str,host:&str,ip:Ipv4Addr,port:u16)->Vec<u8>{
+    let mut out=Vec::with_capacity(512);
+    out.extend_from_slice(&0u16.to_be_bytes()); out.extend_from_slice(&0x8400u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes()); out.extend_from_slice(&4u16.to_be_bytes()); out.extend_from_slice(&0u16.to_be_bytes()); out.extend_from_slice(&0u16.to_be_bytes());
+
+    dns_name(SERVICE_TYPE,&mut out); out.extend_from_slice(&12u16.to_be_bytes()); out.extend_from_slice(&1u16.to_be_bytes()); out.extend_from_slice(&30u32.to_be_bytes());
+    let mut ptr=Vec::new(); dns_name(service,&mut ptr); out.extend_from_slice(&(ptr.len() as u16).to_be_bytes()); out.extend_from_slice(&ptr);
+
+    dns_name(service,&mut out); out.extend_from_slice(&33u16.to_be_bytes()); out.extend_from_slice(&0x8001u16.to_be_bytes()); out.extend_from_slice(&30u32.to_be_bytes());
+    let mut srv=Vec::new(); srv.extend_from_slice(&0u16.to_be_bytes()); srv.extend_from_slice(&0u16.to_be_bytes()); srv.extend_from_slice(&port.to_be_bytes()); dns_name(host,&mut srv);
+    out.extend_from_slice(&(srv.len() as u16).to_be_bytes()); out.extend_from_slice(&srv);
+
+    dns_name(service,&mut out); out.extend_from_slice(&16u16.to_be_bytes()); out.extend_from_slice(&0x8001u16.to_be_bytes()); out.extend_from_slice(&30u32.to_be_bytes());
+    let txt_items=[format!("id={}",workstation_id()),format!("name={}",hostname()),format!("a={ip}:{LEGACY_PORT}"),format!("av2={ip}:{PORT}"),format!("t={}",pairing_token())];
+    let mut txt=Vec::new(); for item in txt_items { if item.len()<=255 {txt.push(item.len() as u8); txt.extend_from_slice(item.as_bytes());}}
+    out.extend_from_slice(&(txt.len() as u16).to_be_bytes()); out.extend_from_slice(&txt);
+
+    dns_name(host,&mut out); out.extend_from_slice(&1u16.to_be_bytes()); out.extend_from_slice(&0x8001u16.to_be_bytes()); out.extend_from_slice(&30u32.to_be_bytes()); out.extend_from_slice(&4u16.to_be_bytes()); out.extend_from_slice(&ip.octets());
+    out
+}
+
+/* ---------- VSD2 protobuf definitions ---------- */
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+enum ImageFormat { Lzf=0, Lzfse=1, Lz4=2, Bmp=3, Jpg=4, Png=5, Invalid=100 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+enum ImageType { Opaque=0, Transparent=1 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+enum ErrorCode { DeviceNotFound=0, DeviceNameAlreadyTaken=1, ResourceLimitReached=2, AuthenticationRejected=3, Cancelled=4, InvalidState=5 }
+
+#[derive(Clone,PartialEq,Message)] struct Size { #[prost(uint32,tag="1")] width:u32, #[prost(uint32,tag="2")] height:u32 }
+#[derive(Clone,PartialEq,Message)] struct Image { #[prost(enumeration="ImageFormat",tag="1")] format:i32, #[prost(enumeration="ImageType",tag="2")] r#type:i32, #[prost(message,optional,tag="3")] size:Option<Size>, #[prost(uint32,tag="4")] row_bytes:u32, #[prost(bytes="vec",tag="5")] image:Vec<u8> }
+#[derive(Clone,PartialEq,Message)] struct ClientInformation { #[prost(string,tag="1")] name:String, #[prost(string,tag="2")] user_agent:String, #[prost(uint32,tag="3")] protocol_version:u32, #[prost(string,optional,tag="4")] device_model:Option<String>, #[prost(string,optional,tag="5")] os_name:Option<String>, #[prost(string,optional,tag="6")] os_version:Option<String> }
+#[derive(Clone,PartialEq,Message)] struct HelloFromClient { #[prost(bytes="vec",tag="1")] public_key:Vec<u8>, #[prost(message,optional,tag="2")] client_information:Option<ClientInformation> }
+#[derive(Clone,PartialEq,Message)] struct Authenticate { #[prost(uint32,tag="1")] request_id:u32 }
+#[derive(Clone,PartialEq,Message)] struct CancelAuthenticate { #[prost(uint32,tag="1")] request_id:u32 }
+#[derive(Clone,PartialEq,Message)] struct KeypadConfig { #[prost(enumeration="ImageFormat",repeated,tag="1")] supported_icon_image_formats:Vec<i32>, #[prost(message,optional,tag="2")] icon_size:Option<Size>, #[prost(message,optional,tag="3")] pressed_icon_size:Option<Size>, #[prost(bool,tag="4")] high_dpi:bool, #[prost(bool,tag="5")] overscale:bool, #[prost(message,optional,tag="6")] layout_crop:Option<Size>, #[prost(bool,tag="7")] enable_context_api:bool }
+fn default_keypad_config() -> KeypadConfig {
+    KeypadConfig {
+        supported_icon_image_formats: vec![ImageFormat::Lz4 as i32, ImageFormat::Png as i32, ImageFormat::Jpg as i32],
+        icon_size: Some(Size { width: 144, height: 144 }),
+        pressed_icon_size: None,
+        high_dpi: true,
+        overscale: true,
+        layout_crop: Some(Size { width: DEFAULT_COLS as u32, height: DEFAULT_ROWS as u32 }),
+        enable_context_api: true,
+    }
+}
+
+#[derive(Clone,PartialEq,Message)] struct UpdateKeypadConfig { #[prost(message,optional,tag="1")] icon_size:Option<Size>, #[prost(message,optional,tag="2")] pressed_icon_size:Option<Size>, #[prost(bool,optional,tag="3")] high_dpi:Option<bool>, #[prost(message,optional,tag="4")] layout_crop:Option<Size> }
+#[derive(Clone,PartialEq,Message)] struct Error { #[prost(uint32,tag="1")] request_id:u32, #[prost(enumeration="ErrorCode",tag="2")] code:i32, #[prost(string,optional,tag="3")] reason:Option<String> }
+#[derive(Clone,PartialEq,Message)] struct OkMsg { #[prost(uint32,tag="1")] request_id:u32 }
+#[derive(Clone,PartialEq,Message)] struct VirtualDevice { #[prost(string,tag="1")] id:String, #[prost(string,tag="2")] name:String }
+#[derive(Clone,PartialEq,Message)] struct OpenVirtualDevice { #[prost(uint32,tag="1")] request_id:u32, #[prost(string,tag="2")] device_id:String, #[prost(message,optional,tag="3")] keypad_config:Option<KeypadConfig> }
+#[derive(Clone,PartialEq,Message)] struct VirtualDeviceOpened { #[prost(uint32,tag="1")] request_id:u32, #[prost(message,optional,tag="2")] device:Option<VirtualDevice> }
+#[derive(Clone,PartialEq,Message)] struct VirtualDeviceList { #[prost(message,repeated,tag="1")] devices:Vec<VirtualDevice> }
+#[derive(Clone,PartialEq,Message)] struct ServiceEndpoints { #[prost(string,repeated,tag="1")] addresses:Vec<String>, #[prost(uint32,tag="2")] port:u32 }
+#[derive(Clone,PartialEq,Message)] struct Context { #[prost(string,tag="1")] profile_id:String, #[prost(uint32,tag="2")] total_pages:u32, #[prost(uint32,tag="3")] current_page:u32, #[prost(message,repeated,tag="4")] actions:Vec<Action> }
+#[derive(Clone,PartialEq,Message)] struct Action { #[prost(uint32,tag="1")] index:u32, #[prost(string,tag="2")] title:String, #[prost(string,tag="3")] name:String, #[prost(string,tag="4")] category:String, #[prost(string,optional,tag="5")] shortcut_id:Option<String> }
+#[derive(Clone,PartialEq,Message)] struct Icon { #[prost(uint32,tag="1")] index:u32, #[prost(message,optional,tag="2")] image:Option<Image> }
+#[derive(Clone,PartialEq,Message)] struct KeyPress { #[prost(uint32,tag="1")] index:u32, #[prost(bool,tag="2")] pressed:bool }
+#[derive(Clone,PartialEq,Message)] struct HelloFromServer { #[prost(string,tag="1")] workstation_id:String, #[prost(string,tag="2")] hostname:String, #[prost(string,tag="3")] version:String, #[prost(uint32,tag="4")] protocol_version:u32, #[prost(bytes="vec",tag="5")] public_key:Vec<u8>, #[prost(bool,tag="6")] client_needs_authentication:bool, #[prost(string,optional,tag="7")] os_name:Option<String>, #[prost(string,optional,tag="8")] os_version:Option<String>, #[prost(message,optional,tag="9")] endpoints:Option<ServiceEndpoints> }
+
+#[derive(Clone,PartialEq,Message)] struct ServerMessage { #[prost(oneof="server_message::Payload",tags="1,2,10,20,21,30,40")] payload:Option<server_message::Payload> }
+mod server_message { use super::*; #[derive(Clone,PartialEq,prost::Oneof)] pub enum Payload {
+    #[prost(message,tag="1")] Error(Error), #[prost(message,tag="2")] Ok(OkMsg), #[prost(message,tag="10")] Hello(HelloFromServer),
+    #[prost(message,tag="20")] VirtualDeviceList(VirtualDeviceList), #[prost(message,tag="21")] VirtualDeviceOpened(VirtualDeviceOpened),
+    #[prost(message,tag="30")] Context(Context), #[prost(message,tag="40")] Icon(Icon)
+} }
+
+#[derive(Clone,PartialEq,Message)] struct ClientMessage { #[prost(oneof="client_message::Payload",tags="1,2,3,10,11,12,20,30,100")] payload:Option<client_message::Payload> }
+mod client_message { use super::*; #[derive(Clone,PartialEq,prost::Oneof)] pub enum Payload {
+    #[prost(message,tag="1")] Hello(HelloFromClient), #[prost(message,tag="2")] Authenticate(Authenticate), #[prost(message,tag="3")] CancelAuthenticate(CancelAuthenticate),
+    #[prost(message,tag="10")] CreateVirtualDevice(CreateVirtualDevice), #[prost(message,tag="11")] OpenVirtualDevice(OpenVirtualDevice), #[prost(message,tag="12")] DeleteVirtualDevice(DeleteVirtualDevice),
+    #[prost(message,tag="20")] KeyPress(KeyPress), #[prost(message,tag="30")] UpdateKeypadConfig(UpdateKeypadConfig), #[prost(message,tag="100")] ClientCapabilities(ClientCapabilities)
+} }
+#[derive(Clone,PartialEq,Message)] struct CreateVirtualDevice {
+    #[prost(uint32,tag="1")] request_id:u32,
+    #[prost(string,tag="2")] name:String,
+    #[prost(message,optional,tag="3")] keypad_config:Option<KeypadConfig>,
+    #[prost(bool,tag="4")] skip_uniqueness_of_name_validation:bool,
+}
+#[derive(Clone,PartialEq,Message)] struct DeleteVirtualDevice { #[prost(uint32,tag="1")] request_id:u32 }
+#[derive(Clone,PartialEq,Message)] struct ClientCapabilities { #[prost(bool,tag="1")] is_user_pro:bool }
+
+fn ok(request_id:u32)->ServerMessage{ServerMessage{payload:Some(server_message::Payload::Ok(OkMsg{request_id}))}}
+fn error_response(request_id:u32,code:ErrorCode,reason:&str)->ServerMessage{ServerMessage{payload:Some(server_message::Payload::Error(Error{request_id,code:code as i32,reason:Some(reason.into())}))}}

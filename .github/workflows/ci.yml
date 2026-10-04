@@ -1,0 +1,51 @@
+name: CI
+
+# Builds the plugin and packages it as an .odPlugin on every push and pull
+# request. The archive is attached to the run as an artifact so a change can be
+# tried before it is released.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      # zip is used by build-plugin.sh; the -dev packages are a safety net for
+      # the windowing crates (they normally dlopen these at runtime).
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zip pkg-config libwayland-dev libxkbcommon-dev
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check shell scripts
+        run: |
+          for script in *.sh; do
+            bash -n "$script"
+          done
+
+      # Fails if VERSION, Cargo.toml and manifest.json disagree.
+      - name: Build and package
+        run: ./build-plugin.sh
+
+      - name: Upload .odPlugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: streamdeck-mobile-odplugin
+          path: dist/*
+          if-no-files-found: error

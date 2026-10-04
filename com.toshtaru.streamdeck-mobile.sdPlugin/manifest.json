@@ -1,0 +1,21 @@
+{
+  "Name": "Stream Deck Mobile",
+  "Description": "Stream Deck Mobile support for OpenDeck via OpenAction",
+  "Author": "Evil Toaster",
+  "Version": "0.8.9",
+  "PluginUUID": "com.toshtaru.streamdeck-mobile",
+  "CodePathLin": "bin/x86_64-unknown-linux-gnu/opendeck-streamdeck-mobile",
+  "CodePaths": {
+    "x86_64-unknown-linux-gnu": "bin/x86_64-unknown-linux-gnu/opendeck-streamdeck-mobile"
+  },
+  "Icon": "icons/plugin",
+  "Category": "Hardware",
+  "HasSettingsInterface": true,
+  "DeviceNamespace": "dm",
+  "OS": [
+    {
+      "Platform": "linux"
+    }
+  ],
+  "Actions": []
+}

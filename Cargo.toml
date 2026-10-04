@@ -1,0 +1,33 @@
+[package]
+name = "opendeck-streamdeck-mobile"
+version = "0.8.9"
+edition = "2024"
+description = "OpenDeck plugin that lets the Stream Deck Mobile Android app act as a virtual button panel (VSD2 protocol)"
+license = "MIT"
+publish = false
+
+[dependencies]
+tokio = { version = "1.48", features = ["full"] }
+tokio-tungstenite = "0.29"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+log = "0.4"
+simplelog = "0.12"
+base64 = "0.22"
+blake2 = "0.10"
+crypto_box = "0.9"
+prost = "0.14"
+lz4_flex = "0.11"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+qrcodegen = "1.8"
+eframe = "0.33"
+winit = "0.30.13"
+urlencoding = "2.1"
+libc = "0.2"
+
+[profile.release]
+strip = true
+lto = true
+panic = "abort"

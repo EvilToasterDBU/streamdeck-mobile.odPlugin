@@ -1,0 +1,13 @@
+# Cargo build output
+/target/
+
+# Built plugin binary and release archives (produced by build-plugin.sh /
+# install-plugin.sh, never committed — they are published as GitHub Release
+# assets by the release workflow)
+/com.toshtaru.streamdeck-mobile.sdPlugin/bin/
+/dist/
+*.odPlugin
+*.zip
+
+# Per-machine Claude Code settings (absolute paths, local permissions)
+/.claude/settings.local.json
